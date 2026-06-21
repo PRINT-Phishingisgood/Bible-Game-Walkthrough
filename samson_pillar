@@ -1,0 +1,600 @@
+"""
+Pillar Balance — Judges 16 (Samson and the Temple) [EASY MODE - FULLY FIXED]
+===================================================
+"And Samson took hold of the two middle pillars upon which the house stood,
+and on which it was borne up... and he bowed himself with all his might; and
+the house fell..." — Judges 16:29-30 (KJV)
+
+HOW IT WORKS
+────────────
+1. THE SET-UP
+   Samson stands centre-stage between two giant pillars. A heavy stone roof
+   rests across their tops.
+
+2. THE TILTING THREAT
+   Every so often a random gust/force shoves one of the pillars, giving it a
+   kick of angular velocity. Each pillar behaves like an INVERTED PENDULUM:
+   gravity torque is *destabilising* — the further it leans, the faster it
+   keeps leaning. Past the critical angle that runaway sharpens hard.
+
+3. THE CONTROLS  (button-mashing / alternation)
+   • LEFT arrow  (or A) → Samson heaves the LEFT pillar back toward vertical.
+   • RIGHT arrow (or D) → Samson heaves the RIGHT pillar back toward vertical.
+   Each *fresh press* delivers a corrective impulse — holding does nothing,
+   so you must rapidly alternate to manage BOTH sides at once.
+
+4. THE BALANCE CHALLENGE
+   Past CRIT_ANGLE (25°) the pillar glows red and its collapse accelerates.
+   Past MAX_ANGLE (45°) the structure fails.
+
+5. WIN / LOSE
+   • WIN  : survive the SURVIVE_TIME countdown (45s). At zero, Samson makes
+            his final push and the temple collapses on command — victory.
+   • LOSE : either pillar passes 45° before the timer runs out → early,
+            accidental collapse → game over.
+
+All art is procedural pygame primitives, matching the Bible Quest portal.
+Tuning knobs live in the constants block up top.
+"""
+
+import pygame
+import sys
+import math
+import random
+
+# ─── Screen / World Layout ──────────────────────────────────────────────────
+SCREEN_W, SCREEN_H = 900, 600
+GROUND_Y   = 520
+CENTER_X   = SCREEN_W // 2
+SPREAD     = 168                       # half-distance between the two pillar bases
+PILLAR_W   = 48
+PILLAR_H   = 332
+ROOF_THICK = 34
+ROOF_EXT   = 36                        # roof overhang beyond each pillar top
+
+LEFT_BASE_X  = CENTER_X - SPREAD
+RIGHT_BASE_X = CENTER_X + SPREAD
+
+# ─── Game Rules ─────────────────────────────────────────────────────────────
+SURVIVE_TIME = 30.0
+CRIT_ANGLE   = 25.0
+MAX_ANGLE    = 45.0
+
+# ─── Physics tuning (Tuned for Easy Mode) ───────────────────────────────────
+GRAV_BASE        = 45.0    # REDUCED (was 95.0): Leaning gravity speed cut in half
+PAST_CRIT_GAIN   = 0.8     # REDUCED (was 1.9): Much lower penalty acceleration past 25°
+DAMP             = 2.2     # INCREASED (was 1.6): Friction/air damping slows down falls
+PRESS_VEL_KICK   = 65.0    # INCREASED (was 42.0): Much stronger velocity push back per press
+PRESS_ANGLE_PULL = 5.5     # INCREASED (was 3.2): Pulls more physical degrees back per press
+
+# Gust difficulty ramps from start → end of the timer
+GUST_INTERVAL_EARLY = 1.80 # SLOWER (was 1.30): More time between early-game gusts
+GUST_INTERVAL_LATE  = 0.85 # SLOWER (was 0.45): Late game gives you breathing room
+GUST_STRENGTH_EARLY = 35.0 # REDUCED (was 55.0): Early bumps are light shoves
+GUST_STRENGTH_LATE  = 75.0 # REDUCED (was 130.0): Late game spikes are completely manageable
+FIRST_GUST_DELAY    = 2.0  # LONGER (was 1.3): More preparation time at start
+
+COLLAPSE_GRAV   = 1.4 * 95.0 # Kept dramatic during actual game-over sequence
+END_TEXT_DELAY  = 2.0       # collapse plays for this long before the end card fades in
+
+# ─── Colours ────────────────────────────────────────────────────────────────
+C_BG_TOP   = (40, 30, 45)
+C_BG_BOT = (20, 15, 25)
+C_FLOOR    = (70, 55, 45)
+C_FLOOR_DK = (48, 38, 30)
+C_PILLAR   = (205, 188, 150)
+C_PILLAR_D = (150, 132, 96)
+C_PILLAR_HI= (230, 218, 188)
+C_CAP      = (180, 160, 120)
+C_ROOF     = (120, 100, 78)
+C_ROOF_D   = (85, 68, 50)
+C_ROOF_HI  = (150, 128, 100)
+C_DANGER   = (210, 70, 55)
+C_WARN     = (235, 180, 70)
+C_SAFE     = (110, 180, 100)
+C_SAMSON   = (200, 160, 120)
+C_SAMSON_D = (160, 120, 85)
+C_HAIR     = (50, 35, 25)
+C_TUNIC    = (150, 90, 60)
+C_DUST     = (140, 120, 95)
+C_HUD_BG   = (15, 12, 20)
+C_WHITE    = (255, 255, 255)
+C_GOLD     = (235, 195, 100)
+
+
+def load_font(size, bold=False):
+    for name in ["Georgia", "Times New Roman", "serif", None]:
+        try:
+            return pygame.font.SysFont(name, size, bold=bold)
+        except Exception:
+            pass
+    return pygame.font.Font(None, size)
+
+
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def lerp(a, b, t):
+    return a + (b - a) * t
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  PILLAR GEOMETRY  —  one source of truth for drawing AND for the roof tops
+# ═══════════════════════════════════════════════════════════════════════════
+def pillar_corners(bx, angle_deg):
+    th = math.radians(angle_deg)
+    s, c = math.sin(th), math.cos(th)
+
+    def pt(off_w, off_u):
+        return (bx + off_w * c + off_u * s,
+                GROUND_Y + off_w * s - off_u * c)
+
+    hw = PILLAR_W / 2
+    bl = pt(-hw, 0)
+    br = pt(hw, 0)
+    tr = pt(hw, PILLAR_H)
+    tl = pt(-hw, PILLAR_H)
+    top = pt(0, PILLAR_H)
+    return bl, br, tr, tl, top
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  PHYSICS
+# ═══════════════════════════════════════════════════════════════════════════
+def update_pillar(p, dt):
+    a = p["angle"]
+    mag = abs(a)
+    extra = 1.0
+    if mag > CRIT_ANGLE:
+        ramp = (mag - CRIT_ANGLE) / max(1e-6, (MAX_ANGLE - CRIT_ANGLE))
+        extra = 1.0 + PAST_CRIT_GAIN * clamp(ramp, 0, 1.5)
+    torque = GRAV_BASE * math.sin(math.radians(a)) * extra
+    p["ang_vel"] += torque * dt
+    p["ang_vel"] *= max(0.0, 1.0 - DAMP * dt)
+    p["angle"]   += p["ang_vel"] * dt
+    p["push_timer"] = max(0.0, p["push_timer"] - dt)
+
+
+def press_pillar(p):
+    a = p["angle"]
+    if abs(a) < 0.01:
+        p["push_timer"] = 0.16
+        return
+    s = 1.0 if a > 0 else -1.0
+    p["ang_vel"] -= s * PRESS_VEL_KICK
+    pull = min(PRESS_ANGLE_PULL, abs(a))
+    p["angle"] -= s * pull
+    p["push_timer"] = 0.16
+
+
+def apply_gust(p, strength):
+    direction = random.choice([-1, 1])
+    p["ang_vel"] += direction * strength
+    return direction
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  DRAWING
+# ═══════════════════════════════════════════════════════════════════════════
+def draw_background(surf, t, shake_amt):
+    for i in range(0, GROUND_Y, 4):
+        f = i / GROUND_Y
+        col = (int(lerp(C_BG_TOP[0], C_BG_BOT[0], f)),
+               int(lerp(C_BG_TOP[1], C_BG_BOT[1], f)),
+               int(lerp(C_BG_TOP[2], C_BG_BOT[2], f)))
+        pygame.draw.rect(surf, col, pygame.Rect(0, i, SCREEN_W, 4))
+
+    for tx in (160, 740):
+        flick = 26 + int(10 * math.sin(t * 7 + tx))
+        glow = pygame.Surface((220, 220), pygame.SRCALPHA)
+        pygame.draw.circle(glow, (255, 170, 70, flick), (110, 110), 90)
+        surf.blit(glow, (tx - 110, 150), special_flags=pygame.BLEND_RGBA_ADD)
+
+    pygame.draw.rect(surf, C_FLOOR, pygame.Rect(0, GROUND_Y, SCREEN_W, SCREEN_H - GROUND_Y))
+    for x in range(0, SCREEN_W, 64):
+        pygame.draw.line(surf, C_FLOOR_DK, (x, GROUND_Y), (x, SCREEN_H), 2)
+    pygame.draw.line(surf, C_FLOOR_DK, (0, GROUND_Y), (SCREEN_W, GROUND_Y), 3)
+
+
+def draw_pillar(surf, bx, angle_deg, danger_frac):
+    bl, br, tr, tl, top = pillar_corners(bx, angle_deg)
+    body = [bl, br, tr, tl]
+    pygame.draw.polygon(surf, C_PILLAR, body)
+    pygame.draw.polygon(surf, C_PILLAR_D, body, 3)
+
+    for k in (0.28, 0.5, 0.72):
+        b = (lerp(bl[0], br[0], k), lerp(bl[1], br[1], k))
+        tp = (lerp(tl[0], tr[0], k), lerp(tl[1], tr[1], k))
+        pygame.draw.line(surf, C_PILLAR_D, b, tp, 2)
+    pygame.draw.line(surf, C_PILLAR_HI, bl, tl, 2)
+
+    th = math.radians(angle_deg)
+    s, c = math.sin(th), math.cos(th)
+
+    def pt(ow, ou):
+        return (bx + ow * c + ou * s, GROUND_Y + ow * s - ou * c)
+
+    cap = [pt(-PILLAR_W / 2 - 9, PILLAR_H - 20), pt(PILLAR_W / 2 + 9, PILLAR_H - 20),
+           pt(PILLAR_W / 2 + 9, PILLAR_H), pt(-PILLAR_W / 2 - 9, PILLAR_H)]
+    pygame.draw.polygon(surf, C_CAP, cap)
+    pygame.draw.polygon(surf, C_PILLAR_D, cap, 2)
+
+    base = [pt(-PILLAR_W / 2 - 11, 0), pt(PILLAR_W / 2 + 11, 0),
+            pt(PILLAR_W / 2 + 11, 20), pt(-PILLAR_W / 2 - 11, 20)]
+    pygame.draw.polygon(surf, C_CAP, base)
+    pygame.draw.polygon(surf, C_PILLAR_D, base, 2)
+
+    if danger_frac > 0:
+        ov = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+        a = int(120 * danger_frac)
+        pygame.draw.polygon(ov, (*C_DANGER, a), body)
+        surf.blit(ov, (0, 0))
+        cseed = int(bx)
+        rng = random.Random(cseed)
+        cx0, cy0 = lerp(bl[0], tl[0], 0.4), lerp(bl[1], tl[1], 0.4)
+        pts = [(cx0, cy0)]
+        for _ in range(4):
+            cx0 += rng.uniform(-10, 10)
+            cy0 -= rng.uniform(18, 30)
+            pts.append((cx0, cy0))
+        pygame.draw.lines(surf, (40, 20, 15), False, pts, 2)
+    return top
+
+
+def draw_roof_attached(surf, L, R):
+    dx, dy = R[0] - L[0], R[1] - L[1]
+    length = math.hypot(dx, dy) or 1
+    ux, uy = dx / length, dy / length
+    nx, ny = -uy, ux
+    if ny > 0:
+        nx, ny = -nx, -ny
+    L2 = (L[0] - ux * ROOF_EXT, L[1] - uy * ROOF_EXT)
+    R2 = (R[0] + ux * ROOF_EXT, R[1] + uy * ROOF_EXT)
+    beam = [L2, R2,
+            (R2[0] + nx * ROOF_THICK, R2[1] + ny * ROOF_THICK),
+            (L2[0] + nx * ROOF_THICK, L2[1] + ny * ROOF_THICK)]
+    pygame.draw.polygon(surf, C_ROOF, beam)
+    pygame.draw.polygon(surf, C_ROOF_D, beam, 3)
+    midx = (L2[0] + R2[0]) / 2 + nx * ROOF_THICK
+    midy = (L2[1] + R2[1]) / 2 + ny * ROOF_THICK
+    apex = (midx + nx * 34, midy + ny * 34)
+    pygame.draw.polygon(surf, C_ROOF_HI, [beam[3], beam[2], apex])
+    pygame.draw.polygon(surf, C_ROOF_D, [beam[3], beam[2], apex], 2)
+
+
+def draw_roof_rect(surf, cx, cy, length, angle_deg):
+    th = math.radians(angle_deg)
+    s, c = math.sin(th), math.cos(th)
+    hl, ht = length / 2, ROOF_THICK / 2
+
+    def pt(ox, oy):
+        return (cx + ox * c - oy * s, cy + ox * s + oy * c)
+
+    quad = [pt(-hl, -ht), pt(hl, -ht), pt(hl, ht), pt(-hl, ht)]
+    pygame.draw.polygon(surf, C_ROOF, quad)
+    pygame.draw.polygon(surf, C_ROOF_D, quad, 3)
+
+
+def draw_samson(surf, left_push, right_push, t, collapse_spread):
+    fx, fy = CENTER_X, GROUND_Y
+    la = -1.0 - left_push * 1.2 - collapse_spread
+    ra = 1.0 + right_push * 1.2 + collapse_spread
+    sway = math.sin(t * 3) * 2
+
+    pygame.draw.line(surf, C_TUNIC, (fx - 4, fy - 40), (fx - 16, fy), 8)
+    pygame.draw.line(surf, C_TUNIC, (fx + 4, fy - 40), (fx + 16, fy), 8)
+    pygame.draw.rect(surf, C_TUNIC, pygame.Rect(fx - 14, fy - 78, 28, 42), border_radius=6)
+    pygame.draw.circle(surf, C_SAMSON, (fx + int(sway), fy - 90), 12)
+    pygame.draw.polygon(surf, C_HAIR, [
+        (fx - 12 + sway, fy - 96), (fx + 12 + sway, fy - 96),
+        (fx + 15 + sway, fy - 70), (fx - 15 + sway, fy - 70)])
+    pygame.draw.circle(surf, C_SAMSON, (fx + int(sway), fy - 90), 11)
+    for side, ang, push in ((-1, la, left_push), (1, ra, right_push)):
+        hand_x = fx + math.sin(ang) * (46 + push * 16)
+        hand_y = fy - 64 - math.cos(ang) * 18 - push * 6
+        pygame.draw.line(surf, C_SAMSON_D, (fx + side * 8, fy - 70), (hand_x, hand_y), 7)
+        pygame.draw.circle(surf, C_SAMSON, (int(hand_x), int(hand_y)), 5)
+
+
+def draw_particles(surf, parts):
+    for p in parts:
+        a = clamp(p["life"] / p["max"], 0, 1)
+        s = pygame.Surface((p["r"] * 2, p["r"] * 2), pygame.SRCALPHA)
+        pygame.draw.circle(s, (*p["color"], int(220 * a)), (p["r"], p["r"]), p["r"])
+        surf.blit(s, (p["x"] - p["r"], p["y"] - p["r"]))
+
+
+def spawn_dust(parts, x, y, n=10):
+    for _ in range(n):
+        ang = random.uniform(0, math.tau)
+        sp = random.uniform(40, 220)
+        parts.append({"x": x + random.uniform(-20, 20), "y": y + random.uniform(-10, 10),
+                      "vx": math.cos(ang) * sp, "vy": math.sin(ang) * sp - 60,
+                      "r": random.randint(3, 8), "color": C_DUST,
+                      "life": random.uniform(0.5, 1.1), "max": 1.1})
+
+
+# ─── HUD ────────────────────────────────────────────────────────────────────
+def draw_tilt_gauge(surf, x, label, angle, font):
+    bw, bh = 22, 180
+    by = 120
+    pygame.draw.rect(surf, (30, 25, 35), pygame.Rect(x, by, bw, bh), border_radius=6)
+    frac = clamp(abs(angle) / MAX_ANGLE, 0, 1)
+    if abs(angle) >= CRIT_ANGLE:
+        col = C_DANGER
+    elif abs(angle) >= CRIT_ANGLE * 0.6:
+        col = C_WARN
+    else:
+        col = C_SAFE
+    fh = int(bh * frac)
+    pygame.draw.rect(surf, col, pygame.Rect(x, by + bh - fh, bw, fh), border_radius=6)
+    crit_y = by + bh - int(bh * (CRIT_ANGLE / MAX_ANGLE))
+    pygame.draw.line(surf, C_WHITE, (x - 4, crit_y), (x + bw + 4, crit_y), 2)
+    pygame.draw.rect(surf, (90, 80, 95), pygame.Rect(x, by, bw, bh), 2, border_radius=6)
+    surf.blit(font.render(label, True, C_WHITE),
+              font.render(label, True, C_WHITE).get_rect(center=(x + bw // 2, by - 14)))
+    deg = font.render(f"{abs(angle):0.0f}\u00b0", True, col)
+    surf.blit(deg, deg.get_rect(center=(x + bw // 2, by + bh + 14)))
+
+
+def draw_hud(surf, time_left, pillars, font_big, font_small, font_tiny):
+    pygame.draw.rect(surf, C_HUD_BG, pygame.Rect(0, 0, SCREEN_W, 60))
+    pygame.draw.line(surf, C_GOLD, (0, 60), (SCREEN_W, 60), 2)
+    surf.blit(font_small.render("Pillar Balance", True, C_GOLD), (16, 18))
+
+    urgent = time_left <= 10
+    tcol = C_DANGER if urgent and int(time_left * 2) % 2 == 0 else C_WHITE
+    tsurf = font_big.render(f"{time_left:0.1f}", True, tcol)
+    surf.blit(tsurf, tsurf.get_rect(center=(CENTER_X, 30)))
+    surf.blit(font_tiny.render("HOLD THE TEMPLE [EASY]", True, (180, 170, 150)),
+              font_tiny.render("HOLD THE TEMPLE [EASY]", True, (180, 170, 150)).get_rect(center=(CENTER_X, 50)))
+
+    prompt = "\u2190 / A  steadies the LEFT pillar      \u2192 / D  steadies the RIGHT pillar"
+    ps = font_tiny.render(prompt, True, (170, 160, 180))
+    surf.blit(ps, ps.get_rect(center=(CENTER_X, SCREEN_H - 18)))
+
+    draw_tilt_gauge(surf, 24, "LEFT", pillars["left"]["angle"], font_tiny)
+    draw_tilt_gauge(surf, SCREEN_W - 46, "RIGHT", pillars["right"]["angle"], font_tiny)
+
+
+def draw_end_screen(surf, won, font_big, font_med, font_small, t, alpha):
+    ov = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+    ov.fill((0, 0, 0, int(180 * alpha)))
+    surf.blit(ov, (0, 0))
+    if alpha < 0.35:
+        return
+    glow = int(200 + 55 * math.sin(t * 2))
+    gold = (glow, int(glow * 0.82), 60)
+
+    if won:
+        head, hc = "The Temple Falls!", C_SAFE
+        sub = "With his final strength, Samson brought the house down."
+    else:
+        head, hc = "Crushed Too Soon", (220, 90, 70)
+        sub = "A pillar gave way before the appointed hour."
+
+    verse = [
+        '"And Samson said, Let me die with the Philistines. And he bowed',
+        ' himself with all his might; and the house fell..."',
+        "— Judges 16:30 (KJV)",
+        "Press R to try again  \u00b7  ESC to return to the Portal",
+    ]
+    y = SCREEN_H // 2 - 150
+    s = font_big.render(head, True, hc)
+    surf.blit(s, s.get_rect(center=(CENTER_X, y))); y += font_big.get_height() + 8
+    s = font_med.render(sub, True, C_WHITE)
+    surf.blit(s, s.get_rect(center=(CENTER_X, y))); y += font_med.get_height() + 22
+    for i, line in enumerate(verse):
+        col = (150, 150, 150) if i == 3 else (200, 175, 120)
+        s = font_small.render(line, True, col)
+        surf.blit(s, s.get_rect(center=(CENTER_X, y)))
+        y += font_small.get_height() + (12 if i == 2 else 4)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  MAIN GAME
+# ═══════════════════════════════════════════════════════════════════════════
+def run():
+    pygame.display.set_caption("Bible Quest — Pillar Balance (Easy Mode)")
+    screen = pygame.display.set_mode((SCREEN_W, SCREEN_H))
+    clock = pygame.time.Clock()
+
+    font_big   = load_font(46, bold=True)
+    font_med   = load_font(22)
+    font_small = load_font(18, bold=True)
+    font_tiny  = load_font(14)
+
+    def new_game():
+        return {
+            "pillars": {
+                "left":  {"base_x": LEFT_BASE_X,  "angle": 0.0, "ang_vel": 0.0, "push_timer": 0.0},
+                "right": {"base_x": RIGHT_BASE_X, "angle": 0.0, "ang_vel": 0.0, "push_timer": 0.0},
+            },
+            "time_left": SURVIVE_TIME,
+            "gust_timer": FIRST_GUST_DELAY,
+            "gust_arrow": None,
+            "result": None,
+            "collapse_t": 0.0,
+            "roof_free": None,
+            "particles": [],
+            "shake": 0.0,
+        }
+
+    state = new_game()
+    t = 0.0
+    running = True
+
+    while running:
+        dt = min(clock.tick(60) / 1000.0, 0.05)
+        t += dt
+
+        # ── Input ──────────────────────────────────────────────────────────
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit(); sys.exit()
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    running = False
+                if event.key == pygame.K_r and state["result"] is not None:
+                    state = new_game()
+                if state["result"] is None:
+                    if event.key in (pygame.K_LEFT, pygame.K_a):
+                        press_pillar(state["pillars"]["left"])
+                    if event.key in (pygame.K_RIGHT, pygame.K_d):
+                        press_pillar(state["pillars"]["right"])
+
+        # ── PLAY ────────────────────────────────────────────────────────────
+        if state["result"] is None:
+            state["time_left"] = max(0.0, state["time_left"] - dt)
+            diff = 1.0 - state["time_left"] / SURVIVE_TIME
+
+            # WIN Condition: Timer hits zero cleanly
+            if state["time_left"] <= 0.0:
+                state["result"] = "win"
+                state["shake"] = 0.7
+                # Set up the explosive celebratory collapse speeds!
+                state["pillars"]["left"]["ang_vel"]  = -260.0
+                state["pillars"]["right"]["ang_vel"] =  260.0
+            else:
+                # Normal gameplay loop active only if not won yet
+                state["gust_timer"] -= dt
+                if state["gust_timer"] <= 0:
+                    strength = lerp(GUST_STRENGTH_EARLY, GUST_STRENGTH_LATE, diff)
+                    side = random.choice(["left", "right"])
+                    d = apply_gust(state["pillars"][side], strength)
+                    if diff > 0.5 and random.random() < 0.35:
+                        other = "right" if side == "left" else "left"
+                        apply_gust(state["pillars"][other], strength * 0.8)
+                    state["gust_arrow"] = {"side": side, "dir": d, "t": 0.5}
+                    state["gust_timer"] = lerp(GUST_INTERVAL_EARLY, GUST_INTERVAL_LATE, diff) * random.uniform(0.8, 1.15)
+
+                for key in ("left", "right"):
+                    update_pillar(state["pillars"][key], dt)
+
+                worst = max(abs(state["pillars"]["left"]["angle"]), abs(state["pillars"]["right"]["angle"]))
+                if worst > CRIT_ANGLE:
+                    state["shake"] = max(state["shake"], (worst - CRIT_ANGLE) / 25.0 * 0.4)
+
+                # LOSE Condition: Only checks if the timer hasn't hit 0 yet
+                if worst > MAX_ANGLE:
+                    state["result"] = "lose"
+                    state["shake"] = 0.7
+                    fail = "left" if abs(state["pillars"]["left"]["angle"]) > MAX_ANGLE else "right"
+                    fp = state["pillars"][fail]
+                    fp["ang_vel"] += math.copysign(180, fp["angle"])
+
+        # ── COLLAPSE ANIMATION SIMULATION ───────────────────────────────────
+        else:
+            state["collapse_t"] += dt
+
+            # If the player won, we calculate a separate dramatic falling simulation
+            # rather than updating via normal destabilizing logic that causes a "lose" state.
+            for key in ("left", "right"):
+                p = state["pillars"][key]
+                if state["result"] == "win":
+                    # Force outward collapse progression without failing angle validation
+                    p["angle"] = clamp(p["angle"] + p["ang_vel"] * dt, -115, 115)
+                else:
+                    p["ang_vel"] += COLLAPSE_GRAV * math.sin(math.radians(p["angle"])) * dt
+                    p["angle"] = clamp(p["angle"] + p["ang_vel"] * dt, -115, 115)
+
+            tops = {k: pillar_corners(state["pillars"][k]["base_x"], state["pillars"][k]["angle"])[4] for k in ("left", "right")}
+            worst = max(abs(state["pillars"]["left"]["angle"]), abs(state["pillars"]["right"]["angle"]))
+
+            if state["roof_free"] is None and (worst > 32 or state["result"] == "win"):
+                L, R = tops["left"], tops["right"]
+                length = math.hypot(R[0] - L[0], R[1] - L[1]) + 2 * ROOF_EXT
+                state["roof_free"] = {
+                    "cx": (L[0] + R[0]) / 2, "cy": (L[1] + R[1]) / 2,
+                    "vx": random.uniform(-30, 30), "vy": 40.0,
+                    "angle": math.degrees(math.atan2(R[1] - L[1], R[0] - L[0])),
+                    "ang_vel": random.uniform(-40, 40), "length": length,
+                }
+            if state["roof_free"] is not None:
+                rf = state["roof_free"]
+                rf["vy"] += 1400 * dt
+                rf["cx"] += rf["vx"] * dt
+                rf["cy"] += rf["vy"] * dt
+                rf["angle"] += rf["ang_vel"] * dt
+                if rf["cy"] < GROUND_Y - 20 and random.random() < 0.6:
+                    spawn_dust(state["particles"], rf["cx"], rf["cy"], 4)
+
+            if state["collapse_t"] < 1.6 and random.random() < 0.5:
+                side = random.choice(["left", "right"])
+                spawn_dust(state["particles"], state["pillars"][side]["base_x"], GROUND_Y, 6)
+
+        # ── particles & timers ──────────────────────────────────────────────
+        for p in state["particles"]:
+            p["vy"] += 500 * dt
+            p["x"] += p["vx"] * dt
+            p["y"] += p["vy"] * dt
+            if p["y"] > GROUND_Y:
+                p["y"] = GROUND_Y; p["vy"] *= -0.3; p["vx"] *= 0.6
+            p["life"] -= dt
+        state["particles"] = [p for p in state["particles"] if p["life"] > 0]
+        state["shake"] = max(0.0, state["shake"] - dt * 1.2)
+        if state["gust_arrow"]:
+            state["gust_arrow"]["t"] -= dt
+            if state["gust_arrow"]["t"] <= 0:
+                state["gust_arrow"] = None
+
+        # ── RENDER ──────────────────────────────────────────────────────────
+        world = pygame.Surface((SCREEN_W, SCREEN_H))
+        draw_background(world, t, state["shake"])
+
+        tops = {}
+        for key in ("left", "right"):
+            p = state["pillars"][key]
+            danger = clamp((abs(p["angle"]) - CRIT_ANGLE) / (MAX_ANGLE - CRIT_ANGLE), 0, 1)
+            tops[key] = draw_pillar(world, p["base_x"], p["angle"], danger)
+
+        if state["roof_free"] is None:
+            draw_roof_attached(world, tops["left"], tops["right"])
+        else:
+            rf = state["roof_free"]
+            draw_roof_rect(world, rf["cx"], rf["cy"], rf["length"], rf["angle"])
+
+        spread = clamp(state["collapse_t"] * 0.4, 0, 0.5) if state["result"] == "win" else 0
+        draw_samson(world, state["pillars"]["left"]["push_timer"] / 0.16, state["pillars"]["right"]["push_timer"] / 0.16, t, spread)
+
+        if state["gust_arrow"]:
+            ga = state["gust_arrow"]
+            top = tops[ga["side"]]
+            ax = top[0] + ga["dir"] * 36
+            ay = top[1] - 10
+            col = (255, 120, 90, int(255 * clamp(ga["t"] / 0.5, 0, 1)))
+            arr = pygame.Surface((40, 24), pygame.SRCALPHA)
+            tip = (32, 12) if ga["dir"] > 0 else (8, 12)
+            tail = (8, 12) if ga["dir"] > 0 else (32, 12)
+            pygame.draw.line(arr, col, tail, tip, 4)
+            pygame.draw.circle(arr, col, tip, 6)
+            world.blit(arr, (ax - 20, ay - 12))
+
+        draw_particles(world, state["particles"])
+
+        ox = oy = 0
+        if state["shake"] > 0:
+            amp = 12 * state["shake"]
+            ox, oy = random.uniform(-amp, amp), random.uniform(-amp, amp)
+        screen.fill((0, 0, 0))
+        screen.blit(world, (ox, oy))
+
+        draw_hud(screen, state["time_left"], state["pillars"], font_big, font_small, font_tiny)
+
+        if state["result"] is not None:
+            alpha = clamp((state["collapse_t"] - END_TEXT_DELAY) / 0.8, 0, 1)
+            draw_end_screen(screen, state["result"] == "win", font_big, font_med, font_small, t, alpha)
+
+        pygame.display.flip()
+
+    pygame.display.set_mode((900, 600))
+    pygame.display.set_caption("Bible Quest — The Portal")
+
+
+if __name__ == "__main__":
+    pygame.init()
+    pygame.font.init()
+    run()
+    pygame.quit()
+    sys.exit()
