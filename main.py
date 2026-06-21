@@ -575,10 +575,10 @@ def launch_game(game_id, active_player_name, chosen_skin):
 
     if game_id == "sheep_maze":
         import sheep_maze
-        score = sheep_maze.run()
+        score = sheep_maze.run(chosen_skin)  # Added chosen_skin!
     elif game_id == "fish_coin":
         import fish_coin
-        score = fish_coin.run()
+        score = fish_coin.run(chosen_skin)  # Added chosen_skin!
         if score:
             global_fish_coins += int(score)  # Convert score output directly into wallet balance
     elif game_id == "feed_crowd":
@@ -588,7 +588,7 @@ def launch_game(game_id, active_player_name, chosen_skin):
     elif game_id == "david_sling":
         import david_sling
         # Inject live balancing config from Redis to control Goliath's parameters
-        score = david_sling.run(chosen_skin)
+        score = david_sling.run(chosen_skin, live_config)
     elif game_id == "babel_tower":
         import babel_tower
         score = babel_tower.run(chosen_skin)

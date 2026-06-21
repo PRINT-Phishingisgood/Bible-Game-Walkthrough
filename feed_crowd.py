@@ -152,7 +152,7 @@ def draw_scenery(surface, t):
         pygame.draw.polygon(surface, C_CROWD_DARK, [(x, cy - 16), (x - 12, cy + 10), (x + 12, cy + 10)])
 
 
-def run():
+def run(skin_data=None):
     pygame.display.set_caption("Bible Quest — Catch & Multiply")
     screen = pygame.display.set_mode((SCREEN_W, SCREEN_H))
     clock = pygame.time.Clock()
