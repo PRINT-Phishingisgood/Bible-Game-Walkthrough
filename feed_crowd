@@ -1,0 +1,453 @@
+"""
+Catch and Multiply — Feeding of the 5,000
+============================================
+"And they all ate and were filled... and they took up of the fragments
+that remained twelve baskets full." — Matthew 14:20 (KJV)
+
+HOW IT WORKS
+────────────
+1. THE PLAYER
+   A disciple holding a basket moves strictly left/right along the bottom
+   of the screen with the arrow keys, catching items that fall from above.
+
+2. FALLING FOOD
+   Loaves and Fish spawn randomly at the top and fall at a steady speed.
+   Catching either ADDS 3 to that food's running total (the miracle of
+   multiplication — one item becomes three).
+
+3. THE HUNGRY CROWD
+   A "Crowd Hunger" bar drains steadily over time. Whenever the player's
+   combined inventory (loaves + fish) reaches 15 or more, the crowd is fed:
+   the inventory resets to 0, a "Feed the Crowd!" banner flashes, and the
+   Hunger bar refills by 25%.
+
+4. HAZARDS
+   Occasionally a Rock falls. Catching one stuns the player for 1.5
+   seconds (no movement) and costs 5 loaves and 5 fish from the current
+   inventory (never below 0).
+
+5. WIN / LOSE
+   - LOSE: the Crowd Hunger bar reaches 0% → Game Over.
+   - WIN: survive the full 60-second service with hunger still above 0%.
+
+All art is drawn procedurally with pygame primitives — no external image
+files required, matching the rest of the Bible Quest portal.
+"""
+
+import pygame
+import sys
+import math
+import random
+
+# ─── Screen Constants ───────────────────────────────────────────────────────
+SCREEN_W, SCREEN_H = 800, 600
+HUD_HEIGHT = 90
+GROUND_Y = SCREEN_H - 60          # where the disciple stands
+
+# ─── Gameplay Constants (tune freely) ──────────────────────────────────────
+SURVIVE_SECONDS     = 60.0
+PLAYER_SPEED        = 360.0       # px/sec
+BASKET_W, BASKET_H  = 70, 36
+
+ITEM_FALL_SPEED_MIN = 140.0
+ITEM_FALL_SPEED_MAX = 230.0
+SPAWN_INTERVAL_MIN  = 0.35        # seconds between spawns
+SPAWN_INTERVAL_MAX  = 0.85
+
+ROCK_CHANCE         = 0.16        # probability a spawned item is a rock
+CATCH_MULTIPLY      = 3           # +3 per loaf/fish caught
+FEED_THRESHOLD      = 15          # combined inventory that triggers feeding
+HUNGER_REFILL       = 25.0        # % restored when crowd is fed
+HUNGER_DRAIN_PER_SEC = 100.0 / 23.0   # empties in ~23s if never fed
+
+ROCK_STUN_DURATION  = 1.5
+ROCK_PENALTY        = 5           # loaves & fish lost when hit by a rock
+
+FEED_FLASH_DURATION = 1.2
+
+# ─── Colours ────────────────────────────────────────────────────────────────
+C_SKY        = (160, 200, 225)
+C_HILL_FAR   = (140, 175, 110)
+C_HILL_NEAR  = (100, 150, 80)
+C_GROUND     = (150, 190, 110)
+C_CROWD_DARK = ( 90,  70,  55)
+C_LOAF       = (170, 120,  60)
+C_LOAF_DARK  = (120,  80,  35)
+C_FISH_BODY  = (170, 190, 200)
+C_FISH_DARK  = ( 90, 120, 140)
+C_ROCK       = (110, 110, 115)
+C_ROCK_DARK  = ( 70,  70,  75)
+C_BASKET     = (160, 120,  60)
+C_BASKET_DARK= (110,  75,  35)
+C_ROBE       = (140, 100, 170)
+C_ROBE_DARK  = ( 95,  65, 125)
+C_SKIN       = (210, 170, 130)
+C_HUD_BG     = ( 25,  20,  15)
+C_WHITE      = (255, 255, 255)
+C_GOLD       = (235, 195, 100)
+C_HUNGER_FULL= ( 90, 190,  90)
+C_HUNGER_MID = (220, 180,  60)
+C_HUNGER_LOW = (210,  70,  60)
+
+
+def load_font(size, bold=False):
+    for name in ["Georgia", "Times New Roman", "serif", None]:
+        try:
+            return pygame.font.SysFont(name, size, bold=bold)
+        except Exception:
+            pass
+    return pygame.font.Font(None, size)
+
+
+# ─── Falling Items ──────────────────────────────────────────────────────────
+class FallingItem:
+    def __init__(self, kind):
+        self.kind = kind                       # "loaf" | "fish" | "rock"
+        self.size = 26 if kind != "rock" else 24
+        self.x = random.uniform(40, SCREEN_W - 40)
+        self.y = -self.size
+        self.speed = random.uniform(ITEM_FALL_SPEED_MIN, ITEM_FALL_SPEED_MAX)
+        self.wobble_phase = random.uniform(0, math.tau)
+        self.spin = random.uniform(-1.5, 1.5)
+        self.angle = 0.0
+
+    def update(self, dt, t):
+        self.y += self.speed * dt
+        self.x += math.sin(t * 2 + self.wobble_phase) * 12 * dt
+        self.angle += self.spin * dt
+
+    def off_screen(self):
+        return self.y > SCREEN_H + 40
+
+    def radius(self):
+        return self.size * 0.55
+
+    def draw(self, surface):
+        x, y = int(self.x), int(self.y)
+        if self.kind == "loaf":
+            draw_loaf(surface, x, y, self.size)
+        elif self.kind == "fish":
+            draw_fish_item(surface, x, y, self.size, self.angle)
+        elif self.kind == "rock":
+            draw_rock(surface, x, y, self.size, self.angle)
+
+
+def draw_loaf(surface, x, y, size):
+    rect = pygame.Rect(0, 0, size * 1.5, size)
+    rect.center = (x, y)
+    pygame.draw.ellipse(surface, C_LOAF, rect)
+    pygame.draw.ellipse(surface, C_LOAF_DARK, rect, width=2)
+    # Score marks on top of the loaf
+    for i in range(-1, 2):
+        sx = x + i * size * 0.3
+        pygame.draw.line(surface, C_LOAF_DARK, (sx, y - size * 0.3), (sx + 4, y), 2)
+
+
+def draw_fish_item(surface, x, y, size, angle):
+    body_w, body_h = size * 1.7, size * 0.8
+    facing = 1 if math.cos(angle) >= 0 else -1
+    tail_pts = [
+        (x - facing * body_w * 0.5, y),
+        (x - facing * (body_w * 0.5 + size * 0.5), y - size * 0.4),
+        (x - facing * (body_w * 0.5 + size * 0.5), y + size * 0.4),
+    ]
+    pygame.draw.polygon(surface, C_FISH_DARK, tail_pts)
+    body_rect = pygame.Rect(0, 0, body_w, body_h)
+    body_rect.center = (x, y)
+    pygame.draw.ellipse(surface, C_FISH_BODY, body_rect)
+    eye_x = x + facing * body_w * 0.28
+    pygame.draw.circle(surface, (20, 20, 20), (int(eye_x), int(y - 1)), 2)
+
+
+def draw_rock(surface, x, y, size, angle):
+    pts = []
+    n = 7
+    rng_amp = size * 0.5
+    for i in range(n):
+        a = angle + (math.tau / n) * i
+        r = rng_amp * (0.8 + 0.2 * math.sin(i * 2.3))
+        pts.append((x + math.cos(a) * r, y + math.sin(a) * r))
+    pygame.draw.polygon(surface, C_ROCK, pts)
+    pygame.draw.polygon(surface, C_ROCK_DARK, pts, width=2)
+
+
+# ─── Player (Disciple with Basket) ──────────────────────────────────────────
+def draw_player(surface, x, y, stunned, t):
+    flicker = stunned and int(t * 12) % 2 == 0
+    robe_col = (220, 90, 80) if flicker else C_ROBE
+    robe_dark = (170, 60, 50) if flicker else C_ROBE_DARK
+
+    # Robe (triangle body)
+    pygame.draw.polygon(surface, robe_col, [
+        (x, y - 46), (x - 22, y), (x + 22, y)
+    ])
+    pygame.draw.polygon(surface, robe_dark, [
+        (x, y - 46), (x - 22, y), (x + 22, y)
+    ], width=2)
+
+    # Head
+    pygame.draw.circle(surface, C_SKIN, (x, y - 56), 11)
+    pygame.draw.arc(surface, robe_dark, pygame.Rect(x - 12, y - 68, 24, 20), 0, math.pi, 3)
+
+    # Basket (the actual catch zone, centred a little below the hands)
+    basket_rect = pygame.Rect(0, 0, BASKET_W, BASKET_H)
+    basket_rect.center = (x, y + 6)
+    pygame.draw.arc(surface, C_BASKET_DARK, basket_rect.inflate(0, 14), math.pi, math.tau, 3)
+    pygame.draw.rect(surface, C_BASKET, basket_rect, border_radius=6)
+    pygame.draw.rect(surface, C_BASKET_DARK, basket_rect, width=2, border_radius=6)
+    for i in range(1, 4):
+        lx = basket_rect.left + i * (BASKET_W // 4)
+        pygame.draw.line(surface, C_BASKET_DARK, (lx, basket_rect.top + 4), (lx, basket_rect.bottom - 4), 1)
+
+
+def basket_rect_for(x, y):
+    rect = pygame.Rect(0, 0, BASKET_W, BASKET_H)
+    rect.center = (x, y + 6)
+    return rect
+
+
+# ─── Background ─────────────────────────────────────────────────────────────
+def draw_background(surface, t):
+    surface.fill(C_SKY)
+    pygame.draw.ellipse(surface, C_HILL_FAR, pygame.Rect(-100, HUD_HEIGHT + 40, 500, 220))
+    pygame.draw.ellipse(surface, C_HILL_FAR, pygame.Rect(450, HUD_HEIGHT + 60, 500, 220))
+    pygame.draw.rect(surface, C_GROUND, pygame.Rect(0, GROUND_Y + 20, SCREEN_W, SCREEN_H - GROUND_Y - 20))
+    pygame.draw.ellipse(surface, C_HILL_NEAR, pygame.Rect(-50, GROUND_Y - 10, SCREEN_W + 100, 80))
+
+    # Suggestion of a seated crowd in the distance (simple dark bumps)
+    rng = random.Random(7)
+    for i in range(26):
+        cx = 20 + i * 30 + rng.randint(-6, 6)
+        cy = GROUND_Y + 14 + rng.randint(-3, 3)
+        pygame.draw.circle(surface, C_CROWD_DARK, (cx, cy), 7)
+
+
+# ─── HUD ────────────────────────────────────────────────────────────────────
+def draw_hud(surface, font_hud, font_small, loaves, fish, hunger, time_left, flash_timer):
+    pygame.draw.rect(surface, C_HUD_BG, pygame.Rect(0, 0, SCREEN_W, HUD_HEIGHT))
+    pygame.draw.line(surface, C_GOLD, (0, HUD_HEIGHT), (SCREEN_W, HUD_HEIGHT), 2)
+
+    title = font_hud.render("Catch and Multiply", True, C_GOLD)
+    surface.blit(title, (16, 8))
+
+    loaf_txt = font_hud.render(f"Loaves: {loaves}", True, C_LOAF)
+    fish_txt = font_hud.render(f"Fish: {fish}", True, C_FISH_BODY)
+    surface.blit(loaf_txt, (16, 36))
+    surface.blit(fish_txt, (170, 36))
+
+    timer_txt = font_hud.render(f"{time_left:0.1f}s", True, C_WHITE)
+    surface.blit(timer_txt, (SCREEN_W - timer_txt.get_width() - 16, 8))
+
+    # Crowd Hunger bar
+    bar_w, bar_h = 320, 16
+    bx, by = SCREEN_W - bar_w - 16, 40
+    pygame.draw.rect(surface, (40, 40, 45), pygame.Rect(bx, by, bar_w, bar_h), border_radius=6)
+    frac = max(0.0, min(1.0, hunger / 100.0))
+    if frac > 0.55:
+        col = C_HUNGER_FULL
+    elif frac > 0.25:
+        col = C_HUNGER_MID
+    else:
+        col = C_HUNGER_LOW
+    pygame.draw.rect(surface, col, pygame.Rect(bx, by, int(bar_w * frac), bar_h), border_radius=6)
+    pygame.draw.rect(surface, C_GOLD, pygame.Rect(bx, by, bar_w, bar_h), width=2, border_radius=6)
+    label = font_small.render("Crowd Hunger", True, (200, 200, 200))
+    surface.blit(label, (bx, by - 16))
+
+    if flash_timer > 0:
+        alpha = min(1.0, flash_timer / FEED_FLASH_DURATION)
+        flash_surf = font_hud.render("Feed the Crowd!", True, C_GOLD)
+        glow_size = flash_surf.get_size()
+        cx = SCREEN_W // 2
+        pos = flash_surf.get_rect(center=(cx, HUD_HEIGHT + 26))
+        # simple pulsing scale via fake outline
+        surface.blit(flash_surf, pos)
+
+
+# ─── End Screens ────────────────────────────────────────────────────────────
+def draw_end_screen(surface, won, font_big, font_med, font_small, t):
+    overlay = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+    overlay.fill((0, 0, 0, 185))
+    surface.blit(overlay, (0, 0))
+
+    glow = int(200 + 55 * math.sin(t * 2))
+    gold = (glow, int(glow * 0.82), 50)
+
+    if won:
+        lines = [
+            (font_big, "They Were All Filled!", gold),
+            (font_med, "The crowd was fed until everyone was satisfied.", C_WHITE),
+        ]
+    else:
+        lines = [
+            (font_big, "The Crowd Went Hungry", (220, 90, 70)),
+            (font_med, "The baskets ran empty before everyone was fed.", C_WHITE),
+        ]
+
+    verse_lines = [
+        (font_small, '"And they did all eat, and were filled: and they took up', (200, 175, 120)),
+        (font_small, ' of the fragments that remained twelve baskets full."', (200, 175, 120)),
+        (font_small, "— Matthew 14:20", (170, 145, 95)),
+        (font_small, "Press ESC to return to the Portal, or R to try again", (150, 150, 150)),
+    ]
+
+    y = SCREEN_H // 2 - 150
+    for fnt, text, color in lines:
+        surf = fnt.render(text, True, color)
+        surface.blit(surf, surf.get_rect(center=(SCREEN_W // 2, y)))
+        y += fnt.get_height() + 10
+
+    y += 14
+    for fnt, text, color in verse_lines:
+        surf = fnt.render(text, True, color)
+        surface.blit(surf, surf.get_rect(center=(SCREEN_W // 2, y)))
+        y += fnt.get_height() + 4
+
+
+# ─── Main Game Function ─────────────────────────────────────────────────────
+def run():
+    """
+    Called from main.py when the player enters the Catch and Multiply door.
+    Runs the game loop and returns when the player exits to the portal.
+    """
+    pygame.display.set_caption("Bible Quest — Catch and Multiply")
+    screen = pygame.display.set_mode((SCREEN_W, SCREEN_H))
+    clock = pygame.time.Clock()
+
+    font_big   = load_font(44, bold=True)
+    font_med   = load_font(20)
+    font_hud   = load_font(20, bold=True)
+    font_small = load_font(15)
+
+    def new_game():
+        return {
+            "phase": "play",           # play -> win / lose
+            "player_x": float(SCREEN_W // 2),
+            "loaves": 0,
+            "fish": 0,
+            "hunger": 100.0,
+            "elapsed": 0.0,
+            "items": [],
+            "spawn_timer": random.uniform(SPAWN_INTERVAL_MIN, SPAWN_INTERVAL_MAX),
+            "stun_timer": 0.0,
+            "feed_flash_timer": 0.0,
+        }
+
+    state = new_game()
+    t = 0.0
+    running = True
+
+    while running:
+        dt = clock.tick(60) / 1000.0
+        dt = min(dt, 0.05)
+        t += dt
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit(); sys.exit()
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    running = False
+                if event.key == pygame.K_r and state["phase"] in ("win", "lose"):
+                    state = new_game()
+
+        keys = pygame.key.get_pressed()
+
+        if state["phase"] == "play":
+            # ── Player movement (disabled while stunned) ────────────────
+            if state["stun_timer"] <= 0:
+                if keys[pygame.K_LEFT]:
+                    state["player_x"] -= PLAYER_SPEED * dt
+                if keys[pygame.K_RIGHT]:
+                    state["player_x"] += PLAYER_SPEED * dt
+                state["player_x"] = max(40, min(SCREEN_W - 40, state["player_x"]))
+            else:
+                state["stun_timer"] -= dt
+
+            if state["feed_flash_timer"] > 0:
+                state["feed_flash_timer"] -= dt
+
+            # ── Spawn falling items ──────────────────────────────────────
+            state["spawn_timer"] -= dt
+            if state["spawn_timer"] <= 0:
+                state["spawn_timer"] = random.uniform(SPAWN_INTERVAL_MIN, SPAWN_INTERVAL_MAX)
+                if random.random() < ROCK_CHANCE:
+                    kind = "rock"
+                else:
+                    kind = random.choice(["loaf", "fish"])
+                state["items"].append(FallingItem(kind))
+
+            # ── Update items + collisions ────────────────────────────────
+            basket = basket_rect_for(state["player_x"], GROUND_Y)
+            remaining = []
+            for item in state["items"]:
+                item.update(dt, t)
+                caught = False
+                if not item.off_screen():
+                    dist = math.hypot(item.x - basket.centerx, item.y - basket.centery)
+                    if dist < (item.radius() + BASKET_W * 0.4):
+                        caught = True
+
+                if caught:
+                    if item.kind == "loaf":
+                        state["loaves"] += CATCH_MULTIPLY
+                    elif item.kind == "fish":
+                        state["fish"] += CATCH_MULTIPLY
+                    elif item.kind == "rock":
+                        state["stun_timer"] = ROCK_STUN_DURATION
+                        state["loaves"] = max(0, state["loaves"] - ROCK_PENALTY)
+                        state["fish"] = max(0, state["fish"] - ROCK_PENALTY)
+                    # item consumed — do not keep it
+                elif not item.off_screen():
+                    remaining.append(item)
+            state["items"] = remaining
+
+            # ── Feed the crowd check ────────────────────────────────────
+            combined = state["loaves"] + state["fish"]
+            if combined >= FEED_THRESHOLD:
+                state["loaves"] = 0
+                state["fish"] = 0
+                state["hunger"] = min(100.0, state["hunger"] + HUNGER_REFILL)
+                state["feed_flash_timer"] = FEED_FLASH_DURATION
+
+            # ── Hunger drain ─────────────────────────────────────────────
+            state["hunger"] -= HUNGER_DRAIN_PER_SEC * dt
+            state["elapsed"] += dt
+
+            if state["hunger"] <= 0:
+                state["hunger"] = 0
+                state["phase"] = "lose"
+            elif state["elapsed"] >= SURVIVE_SECONDS:
+                state["phase"] = "win"
+
+        # ── Draw ─────────────────────────────────────────────────────────
+        draw_background(screen, t)
+
+        for item in state["items"]:
+            item.draw(screen)
+
+        draw_player(screen, int(state["player_x"]), GROUND_Y, state["stun_timer"] > 0, t)
+
+        time_left = max(0.0, SURVIVE_SECONDS - state["elapsed"])
+        draw_hud(screen, font_hud, font_small, state["loaves"], state["fish"],
+                  state["hunger"], time_left, state["feed_flash_timer"])
+
+        if state["stun_timer"] > 0:
+            stun_txt = font_med.render("Stunned!", True, (220, 90, 70))
+            screen.blit(stun_txt, stun_txt.get_rect(center=(SCREEN_W // 2, GROUND_Y - 90)))
+
+        if state["phase"] in ("win", "lose"):
+            draw_end_screen(screen, state["phase"] == "win", font_big, font_med, font_small, t)
+
+        pygame.display.flip()
+
+    pygame.display.set_mode((900, 600))
+    pygame.display.set_caption("Bible Quest — The Portal")
+
+
+if __name__ == "__main__":
+    pygame.init()
+    pygame.font.init()
+    run()
+    pygame.quit()
+    sys.exit()
